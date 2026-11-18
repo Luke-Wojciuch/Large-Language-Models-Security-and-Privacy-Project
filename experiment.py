@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,11 +97,10 @@ def _install_judge(pipeline, config, client):
     loop.elements[index] = JudgedToolsExecutor(judge)
 
 
-def run_experiment(config: ExperimentConfig):
+def run_experiment(config: ExperimentConfig, *, print_task_progress: bool = False):
     """Return raw benchmark results keyed by condition, then suite."""
     from contextlib import ExitStack
 
-    from agentdojo.benchmark import benchmark_suite_without_injections
     from agentdojo.logging import OutputLogger
     from agentdojo.task_suite.load_suites import get_suite
 
@@ -133,16 +133,52 @@ def run_experiment(config: ExperimentConfig):
                         if config.task_limit is not None
                         else None
                     )
-                    results[condition][suite_name] = benchmark_suite_without_injections(
-                        agent_pipeline=pipeline,
-                        suite=suite,
-                        logdir=log_dir,
-                        force_rerun=config.force_rerun,
-                        user_tasks=task_ids,
-                        benchmark_version=config.benchmark_version,
+                    results[condition][suite_name] = _run_suite(
+                        config, pipeline, suite, log_dir, task_ids, print_task_progress
                     )
 
     return results
+
+
+def _run_suite(config, pipeline, suite, log_dir, task_ids, print_task_progress):
+    from agentdojo.benchmark import (
+        benchmark_suite_without_injections,
+        run_task_without_injection_tasks,
+    )
+
+    if not print_task_progress:
+        return benchmark_suite_without_injections(
+            agent_pipeline=pipeline,
+            suite=suite,
+            logdir=log_dir,
+            force_rerun=config.force_rerun,
+            user_tasks=task_ids,
+            benchmark_version=config.benchmark_version,
+        )
+
+    selected_ids = list(suite.user_tasks) if task_ids is None else task_ids
+    utility_results = {}
+    security_results = {}
+    for index, task_id in enumerate(selected_ids, start=1):
+        task = suite.get_user_task_by_id(task_id)
+        started = time.perf_counter()
+        utility, security = run_task_without_injection_tasks(
+            suite, pipeline, task, log_dir, config.force_rerun, config.benchmark_version
+        )
+        elapsed = time.perf_counter() - started
+        utility_results[(task.ID, "")] = utility
+        security_results[(task.ID, "")] = security
+        outcome = "passed" if utility else "failed"
+        print(
+            f"[{pipeline.name} / {suite.name}] {index}/{len(selected_ids)} "
+            f"{task.ID}: {outcome} in {elapsed:.1f}s",
+            flush=True,
+        )
+    return {
+        "utility_results": utility_results,
+        "security_results": security_results,
+        "injection_tasks_utility_results": {},
+    }
 
 
 def print_summary(results):
@@ -176,7 +212,9 @@ def main():
     parser.add_argument("--timeout", type=float, default=defaults.timeout)
     parser.add_argument("--max-retries", type=int, default=defaults.max_retries)
     parser.add_argument("--reuse-results", dest="force_rerun", action="store_false")
+    parser.add_argument("--print-task-progress", action="store_true")
     options = vars(parser.parse_args())
+    print_task_progress = options.pop("print_task_progress")
     if options.pop("all_tasks"):
         options["task_limit"] = None
     options["suites"] = tuple(options["suites"])
@@ -185,7 +223,7 @@ def main():
         config = ExperimentConfig(**options)
     except ValueError as error:
         parser.error(str(error))
-    print_summary(run_experiment(config))
+    print_summary(run_experiment(config, print_task_progress=print_task_progress))
 
 
 if __name__ == "__main__":
