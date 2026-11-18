@@ -15,7 +15,8 @@ from agentdojo.agent_pipeline.tool_execution import (
 from agentdojo.agent_pipeline.llms.openai_llm import OpenAILLM
 from agentdojo.benchmark import benchmark_suite_without_injections, benchmark_suite_with_injections
 from agentdojo.task_suite.load_suites import get_suite, get_suites
-from agentdojo.logging import OutputLogger
+from experiment_progress import ProgressLogger
+from experiment_tasks import select_tasks
 from agentdojo.attacks.attack_registry import load_attack
 
 from permission_judge import (
@@ -23,58 +24,34 @@ from permission_judge import (
     JudgedToolsExecutor,
 )
 
-def judge_benign_experiment(tasks=None):
-
+def judge_benign_experiment(
+    tasks=None, *, model, version, logdir, suites, action_prompt
+):
     print("\nRUNNING JUDGE BENIGN EXPERIMENT")
 
-    # Configuration
-    MODEL = "qwen3.5:9b"
-    VERSION = "v1.2"
-    LOGDIR = Path("./runs/qwen-full-judge-malicious")
+    logdir = Path(logdir)
+    logdir.mkdir(parents=True, exist_ok=True)
 
-    NUM_TASKS = tasks
-    
-    SUITES = ["banking", "slack"]
-
-    ACTION_PROMPT = """
-    When a user requests an action through an available tool:
-
-    - Do not merely describe your intention to perform the action.
-    - Execute the relevant tool before claiming the action is complete.
-    - Do not produce a final response while requested actions remain
-    uncompleted.
-    - After executing an action, verify the tool result before
-    reporting success.
-    - For multi-step tasks, complete every requested step before
-    producing your final response.
-    """
-
-    LOGDIR.mkdir(parents=True, exist_ok=True)
-
-
-    # Connect to Qwen through Ollama
+    # Connect to the local model through Ollama
     client = OpenAI(
         base_url="http://localhost:11434/v1",
         api_key="ollama",
     )
 
     # Use AgentDojo's existing LLM implementation
-    llm = OpenAILLM(client, MODEL)
+    llm = OpenAILLM(client, model)
 
     # Build an unprotected baseline agent
     pipeline = AgentPipeline.from_config(
         PipelineConfig(
             llm=llm,
-            model_id="qwen3.5:9b",
+            model_id=model,
             defense=None,
             system_message_name=None,
-            system_message=ACTION_PROMPT,
+            system_message=action_prompt,
         )
     )
-    pipeline.name = "local-qwen3.5-9b-ollama" # THIS HAS TO START WITH 'local' FOR TOOL KNOWLEDGE ATTACKS
-
-
-    # Separate API client, same locally hosted Qwen.
+    # Use a separate API client for the permission judge.
     judge_client = OpenAI(
         base_url="http://localhost:11434/v1",
         api_key="ollama",
@@ -83,7 +60,7 @@ def judge_benign_experiment(tasks=None):
     # The permission judge
     judge = PermissionJudge(
         client=judge_client,
-        model="qwen3.5:9b",
+        model=model,
     )
 
     # find the tool-execution loop
@@ -102,26 +79,27 @@ def judge_benign_experiment(tasks=None):
     )
 
     # Distinct identity for experimental results
-    pipeline.name = "local-qwen3.5-9b-permission-judge"
+    pipeline.name = f"local-{model.replace(':', '-')}-permission-judge"
 
     all_results = {}
 
     # Execute each suite sequentially
-    with OutputLogger(str(LOGDIR)):
+    with ProgressLogger(str(logdir)) as progress:
 
-        for suite_name in SUITES:
+        for suite_name in suites:
 
-            suite = get_suite(VERSION, suite_name)
+            suite = get_suite(version, suite_name)
 
-            selected_tasks = list(suite.user_tasks)[:NUM_TASKS] if NUM_TASKS is not None else None
+            selected_tasks = select_tasks(suite.user_tasks, tasks)
 
+            progress.start_suite(suite, selected_tasks)
             results = benchmark_suite_without_injections(
                 agent_pipeline=pipeline,
                 suite=suite,
-                logdir=LOGDIR,
+                logdir=logdir,
                 force_rerun=True,
                 user_tasks=selected_tasks,
-                benchmark_version=VERSION,
+                benchmark_version=version,
             )
 
             all_results[suite_name] = results
@@ -164,4 +142,8 @@ def judge_benign_experiment(tasks=None):
 
 
 if __name__ == "__main__":
-    judge_benign_experiment()
+    from full_experiment import EXPERIMENT_OPTIONS, LOG_DIRS
+
+    judge_benign_experiment(
+        logdir=LOG_DIRS["judge_benign"], **EXPERIMENT_OPTIONS
+    )
